@@ -24,12 +24,70 @@ THE SOFTWARE.  */
 
 #include <assert.h>
 #include <math.h>
+#include <stdlib.h>
 #include <inttypes.h>
 #include <ctype.h>
 #include <htslib/kfunc.h>
 #include <htslib/khash_str2int.h>
 #include "call.h"
 #include "prob1.h"
+
+// ---------------------------------------------------------------------------
+// Debug instrumentation for step-by-step tracing of `bcftools call -m`.
+// Switch on with the environment variable BCFTOOLS_DEBUG_MCALL:
+//   0/absent  - off (default; no output, no behaviour change)
+//   1         - per-site summary: qsum AF priors, chosen allele set, site
+//               QUAL, AC/AN, final alleles, branch taken
+//   2         - per-sample detail: raw PLs, normalized P(D|G), GT/GP/GQ
+//   3         - per-allele-combination enumeration inside mcall_find_best_alleles
+// All lines go to stderr with a `[MCALL DBG] site=CHR:POS step=...` prefix and
+// key=value pairs, one event per line, so that they can be grepped/awk'd.
+// ---------------------------------------------------------------------------
+static int mcall_dbg_level(void)
+{
+    static int lvl = -1;
+    if ( lvl < 0 )
+    {
+        const char *s = getenv("BCFTOOLS_DEBUG_MCALL");
+        lvl = s ? atoi(s) : 0;
+    }
+    return lvl;
+}
+#define MCALL_DBG_PFX(call,rec) \
+    fprintf(stderr, "[MCALL DBG] site=%s:%"PRId64, \
+            bcf_seqname((call)->hdr, (rec)), (int64_t)(rec)->pos+1)
+static void mcall_dbg_vals_i32(const char *label, const int32_t *v, int n)
+{
+    int i;
+    fprintf(stderr, " %s=", label);
+    for (i=0; i<n; i++) fprintf(stderr, "%s%d", i ? "," : "", v[i]);
+}
+static void mcall_dbg_vals_f(const char *label, const float *v, int n)
+{
+    int i;
+    fprintf(stderr, " %s=", label);
+    for (i=0; i<n; i++) fprintf(stderr, "%s%.6g", i ? "," : "", v[i]);
+}
+static void mcall_dbg_vals_d(const char *label, const double *v, int n)
+{
+    int i;
+    fprintf(stderr, " %s=", label);
+    for (i=0; i<n; i++) fprintf(stderr, "%s%.6g", i ? "," : "", v[i]);
+}
+static void mcall_dbg_gt(const int32_t *gts)
+{
+    int k;
+    fprintf(stderr, " gt=");
+    for (k=0; k<2; k++)
+    {
+        int32_t g = gts[k];
+        if ( k>0 ) fputc('/', stderr);
+        if ( g==bcf_int32_vector_end ) { if ( k==0 ) fputc('.', stderr); }
+        else if ( g==bcf_gt_missing ) fputc('.', stderr);
+        else fprintf(stderr, "%d", bcf_gt_allele(g));
+    }
+}
+// ---------------------------------------------------------------------------
 
 // Avoid having to include all of bcftools.h
 static inline int isspace_c(char c) { return isspace((unsigned char) c); }
@@ -399,6 +457,7 @@ void mcall_init(call_t *call)
     // init the prior
     if ( call->theta>0 )
     {
+        double theta_raw = call->theta;
         int i, n = 0;
         if ( !call->ploidy ) n = 2*bcf_hdr_nsamples(call->hdr); // all are diploid
         else
@@ -416,6 +475,9 @@ void mcall_init(call_t *call)
             call->theta = 0.99;
         }
         call->theta = log(call->theta);
+        if ( mcall_dbg_level()>=1 )
+            fprintf(stderr, "[MCALL DBG] step=init theta_raw=%.6g aM=%.6g theta=%.6g n=%d nsmpl_grp=%d ploidy=%s\n",
+                    theta_raw, aM, call->theta, n, call->nsmpl_grp, call->ploidy ? "per-sample" : "all-diploid");
     }
 }
 
@@ -615,6 +677,12 @@ static int mcall_find_best_alleles(call_t *call, int nals, smpl_grp_t *grp)
         if ( ia==0 ) ref_lk = lk_tot;   // likelihood of 0/0 for all samples
         else lk_tot += call->theta; // the prior
         UPDATE_MAX_LKs(1<<ia, ia>0 && lk_tot_set);
+        if ( mcall_dbg_level()>=3 )
+        {
+            MCALL_DBG_PFX(call, call->rec);
+            fprintf(stderr, " step=combo group=%ld combo=0x%x nals=1 lk_tot=%.6g ref_lk=%.6g\n",
+                    (long)(grp-call->smpl_grp), (unsigned)(1<<ia), lk_tot, ref_lk);
+        }
     }
 
     // Two alleles
@@ -649,6 +717,12 @@ static int mcall_find_best_alleles(call_t *call, int nals, smpl_grp_t *grp)
                 if ( ia!=0 ) lk_tot += call->theta;    // the prior
                 if ( ib!=0 ) lk_tot += call->theta;
                 UPDATE_MAX_LKs(1<<ia|1<<ib, lk_tot_set);
+                if ( mcall_dbg_level()>=3 )
+                {
+                    MCALL_DBG_PFX(call, call->rec);
+                    fprintf(stderr, " step=combo group=%ld combo=0x%x nals=2 fa=%.6g fb=%.6g lk_tot=%.6g\n",
+                            (long)(grp-call->smpl_grp), (unsigned)(1<<ia|1<<ib), fa, fb, lk_tot);
+                }
             }
         }
     }
@@ -695,6 +769,12 @@ static int mcall_find_best_alleles(call_t *call, int nals, smpl_grp_t *grp)
                     if ( ib!=0 ) lk_tot += call->theta;    // the prior
                     if ( ic!=0 ) lk_tot += call->theta;    // the prior
                     UPDATE_MAX_LKs(1<<ia|1<<ib|1<<ic, lk_tot_set);
+                    if ( mcall_dbg_level()>=3 )
+                    {
+                        MCALL_DBG_PFX(call, call->rec);
+                        fprintf(stderr, " step=combo group=%ld combo=0x%x nals=3 fa=%.6g fb=%.6g fc=%.6g lk_tot=%.6g\n",
+                                (long)(grp-call->smpl_grp), (unsigned)(1<<ia|1<<ib|1<<ic), fa, fb, fc, lk_tot);
+                    }
                 }
             }
         }
@@ -841,6 +921,15 @@ static void mcall_call_genotypes(call_t *call, int nals_ori, smpl_grp_t *grp)
 
         call->ac[ bcf_gt_allele(gts[0]) ]++;
         if ( gts[1]!=bcf_int32_vector_end ) call->ac[ bcf_gt_allele(gts[1]) ]++;
+        if ( mcall_dbg_level()>=2 )
+        {
+            MCALL_DBG_PFX(call, call->rec);
+            fprintf(stderr, " step=gt_sample group=%ld sample=%d ploidy=%d", (long)(grp - call->smpl_grp), ismpl, ploidy);
+            mcall_dbg_gt(gts);
+            fprintf(stderr, " best_lk=%.6g", best_lk);
+            mcall_dbg_vals_f("GP_raw", gps, ngts_new);
+            fputc('\n', stderr);
+        }
     }
     if ( !(call->output_tags & (CALL_FMT_GQ|CALL_FMT_GP)) ) return;
     double max, sum;
@@ -884,6 +973,13 @@ static void mcall_call_genotypes(call_t *call, int nals_ori, smpl_grp_t *grp)
             assert( max );
             for (i=0; i<nmax; i++) gps[i] = gps[i]/sum;
             for (; i<ngts_new; i++) bcf_float_set_vector_end(gps[i]);
+        }
+        if ( mcall_dbg_level()>=2 )
+        {
+            MCALL_DBG_PFX(call, call->rec);
+            fprintf(stderr, " step=gq_sample sample=%d gq=%d", ismpl, call->GQs[ismpl]);
+            mcall_dbg_vals_f("GP", gps, nmax);
+            fputc('\n', stderr);
         }
     }
 }
@@ -1423,8 +1519,23 @@ int mcall(call_t *call, bcf1_t *rec)
 {
     int i,j, unseen = call->unseen;
 
+    call->rec = rec;    // used by the debug instrumentation below to print the site
+
+    if ( mcall_dbg_level()>=1 )
+    {
+        MCALL_DBG_PFX(call,rec);
+        fprintf(stderr, " step=begin nals_ori=%d nsmpl=%d nsmpl_grp=%d theta=%.6g unseen=%d ploidy=%s flag=0x%x\n",
+                rec->n_allele, bcf_hdr_nsamples(call->hdr), call->nsmpl_grp, call->theta, unseen,
+                call->ploidy ? "per-sample" : "all-diploid", call->flag);
+    }
+
     // Force alleles when calling genotypes given alleles was requested
     if ( call->flag & CALL_CONSTR_ALLELES && mcall_constrain_alleles(call, rec, &unseen)!=0 ) return -2;
+    if ( mcall_dbg_level()>=1 && (call->flag & CALL_CONSTR_ALLELES) )
+    {
+        MCALL_DBG_PFX(call,rec);
+        fprintf(stderr, " step=constrain_alleles nals=%d unseen=%d\n", rec->n_allele, unseen);
+    }
 
     int nsmpl    = bcf_hdr_nsamples(call->hdr);
     int nals_ori = rec->n_allele;
@@ -1437,10 +1548,38 @@ int mcall(call_t *call, bcf1_t *rec)
     if ( call->nPLs!=nsmpl*nals_ori*(nals_ori+1)/2 && call->nPLs!=nsmpl*nals_ori )  // a mixture of diploid and haploid or haploid only
         error("Wrong number of PL fields? nals=%d npl=%d\n", nals_ori,call->nPLs);
 
+    if ( mcall_dbg_level()>=2 )
+    {
+        int npls_smpl = call->nPLs / nsmpl;
+        const int32_t *pls = call->PLs;
+        for (i=0; i<nsmpl; i++)
+        {
+            MCALL_DBG_PFX(call,rec);
+            fprintf(stderr, " step=PL sample=%d", i);
+            mcall_dbg_vals_i32("vals", pls, npls_smpl);
+            fputc('\n', stderr);
+            pls += npls_smpl;
+        }
+    }
+
     // Convert PLs to probabilities
     int ngts_ori = nals_ori*(nals_ori+1)/2;
     hts_expand(double, call->nPLs, call->npdg, call->pdg);
     set_pdg(call->pl2p, call->PLs, call->pdg, nsmpl, ngts_ori, unseen);
+
+    if ( mcall_dbg_level()>=2 )
+    {
+        int npls_smpl = call->nPLs / nsmpl;
+        const double *pdg = call->pdg;
+        for (i=0; i<nsmpl; i++)
+        {
+            MCALL_DBG_PFX(call,rec);
+            fprintf(stderr, " step=pdg sample=%d", i);
+            mcall_dbg_vals_d("vals", pdg, npls_smpl);
+            fputc('\n', stderr);
+            pdg += npls_smpl;
+        }
+    }
 
     // Get sum of qualities, serves as an AF estimate, f_x = QS/N in Eq. 1 in call-m math notes.
     if ( call->nsmpl_grp == 1  )
@@ -1453,6 +1592,13 @@ int mcall(call_t *call, bcf1_t *rec)
             // typically ref-only site with <*> in ALT.
             hts_expand(float,nals_ori,call->smpl_grp[0].nqsum,call->smpl_grp[0].qsum);
             for (i=nqs; i<nals_ori; i++) call->smpl_grp[0].qsum[i] = 0;
+        }
+        if ( mcall_dbg_level()>=1 )
+        {
+            MCALL_DBG_PFX(call,rec);
+            fprintf(stderr, " step=qsum_raw group=0");
+            mcall_dbg_vals_f("vals", call->smpl_grp[0].qsum, nals_ori);
+            fputc('\n', stderr);
         }
     }
     else
@@ -1493,6 +1639,16 @@ int mcall(call_t *call, bcf1_t *rec)
                 }
             }
         }
+        if ( mcall_dbg_level()>=2 )
+        {
+            for (j=0; j<call->nsmpl_grp; j++)
+            {
+                MCALL_DBG_PFX(call,rec);
+                fprintf(stderr, " step=qsum_grouped group=%d nsmpl=%d", j, call->smpl_grp[j].nsmpl);
+                mcall_dbg_vals_f("vals", call->smpl_grp[j].qsum, nals_ori);
+                fputc('\n', stderr);
+            }
+        }
     }
 
     // If available, take into account reference panel AFs
@@ -1517,6 +1673,16 @@ int mcall(call_t *call, bcf1_t *rec)
                 call->smpl_grp[j].qsum[0] = (call->smpl_grp[j].qsum[0] + 0.5*ac0) / (call->smpl_grp[j].nsmpl + 0.5*an);
         }
     }
+    if ( mcall_dbg_level()>=2 && call->prior_AN )
+    {
+        for (j=0; j<call->nsmpl_grp; j++)
+        {
+            MCALL_DBG_PFX(call,rec);
+            fprintf(stderr, " step=qsum_panel group=%d", j);
+            mcall_dbg_vals_f("vals", call->smpl_grp[j].qsum, nals_ori);
+            fputc('\n', stderr);
+        }
+    }
 
     // normalize so that QS sums to 1 for each group
     for (j=0; j<call->nsmpl_grp; j++)
@@ -1524,6 +1690,16 @@ int mcall(call_t *call, bcf1_t *rec)
         float sum = 0;
         for (i=0; i<nals_ori; i++) sum += call->smpl_grp[j].qsum[i];
         if ( sum ) for (i=0; i<nals_ori; i++) call->smpl_grp[j].qsum[i] /= sum;
+    }
+    if ( mcall_dbg_level()>=1 )
+    {
+        for (j=0; j<call->nsmpl_grp; j++)
+        {
+            MCALL_DBG_PFX(call,rec);
+            fprintf(stderr, " step=qsum group=%d nsmpl=%d", j, call->smpl_grp[j].nsmpl);
+            mcall_dbg_vals_f("vals", call->smpl_grp[j].qsum, nals_ori);
+            fputc('\n', stderr);
+        }
     }
 
     bcf_update_info_int32(call->hdr, rec, "QS", NULL, 0);      // remove QS tag
@@ -1542,6 +1718,12 @@ int mcall(call_t *call, bcf1_t *rec)
         smpl_grp_t *grp = &call->smpl_grp[j];
         mcall_find_best_alleles(call, nals_ori, grp);
         call->als_new |= grp->als;
+        if ( mcall_dbg_level()>=1 )
+        {
+            MCALL_DBG_PFX(call,rec);
+            fprintf(stderr, " step=best_alleles group=%d als=0x%x nals=%u max_lk=%.6g ref_lk=%.6g lk_sum=%.6g\n",
+                    j, grp->als, grp->nals, grp->max_lk, grp->ref_lk, grp->lk_sum);
+        }
         if ( grp->max_lk==-HUGE_VAL ) continue;
         double qual = -4.343*(grp->ref_lk - logsumexp2(grp->lk_sum,grp->ref_lk));
         if ( max_qual < qual )
@@ -1550,6 +1732,11 @@ int mcall(call_t *call, bcf1_t *rec)
             lk_sum = grp->lk_sum;
             ref_lk = grp->ref_lk;
         }
+    }
+    if ( mcall_dbg_level()>=1 )
+    {
+        MCALL_DBG_PFX(call,rec);
+        fprintf(stderr, " step=site als_new=0x%x max_qual=%.6g\n", call->als_new, max_qual);
     }
 
     // Make sure the REF allele is always present
@@ -1572,15 +1759,24 @@ int mcall(call_t *call, bcf1_t *rec)
     }
 
     init_allele_trimming_maps(call,nals_ori,call->als_new);
+    if ( mcall_dbg_level()>=1 )
+    {
+        MCALL_DBG_PFX(call,rec);
+        fprintf(stderr, " step=alleles is_variant=%d als_new=0x%x nals_new=%d", is_variant, (unsigned)call->als_new, call->nals_new);
+        mcall_dbg_vals_i32("als_map", call->als_map, nals_ori);
+        fputc('\n', stderr);
+    }
 
     int nAC = 0;
     if ( call->als_new==1 )   // only REF allele on output
     {
+        if ( mcall_dbg_level()>=1 ) { MCALL_DBG_PFX(call,rec); fprintf(stderr, " step=genotypes mode=ref_only\n"); }
         mcall_set_ref_genotypes(call,nals_ori);
         bcf_update_format_int32(call->hdr, rec, "PL", NULL, 0);    // remove PL, useless now
     }
     else if ( !is_variant )
     {
+        if ( mcall_dbg_level()>=1 ) { MCALL_DBG_PFX(call,rec); fprintf(stderr, " step=genotypes mode=ref_with_PL (-A)\n"); }
         mcall_set_ref_genotypes(call,nals_ori);     // running with -A, prevent mcall_call_genotypes from putting some ALT back
         mcall_trim_and_update_PLs(call, rec, nals_ori, call->nals_new);
     }
@@ -1588,6 +1784,7 @@ int mcall(call_t *call, bcf1_t *rec)
     {
         // The most likely set of alleles includes non-reference allele (or was enforced), call genotypes.
         // Note that it is a valid outcome if the called genotypes exclude some of the ALTs.
+        if ( mcall_dbg_level()>=1 ) { MCALL_DBG_PFX(call,rec); fprintf(stderr, " step=genotypes mode=variant\n"); }
         int ngts_new = call->nals_new*(call->nals_new+1)/2;
         hts_expand(float,ngts_new*nsmpl,call->nGPs,call->GPs);
         for (i=0; i<call->nals_new; i++) call->ac[i] = 0;
@@ -1640,11 +1837,23 @@ int mcall(call_t *call, bcf1_t *rec)
         else
             bcf_float_set_missing(rec->qual);
     }
+    if ( mcall_dbg_level()>=1 )
+    {
+        MCALL_DBG_PFX(call,rec);
+        fprintf(stderr, " step=qual nAC=%d qual=%.6g lk_sum=%.6g ref_lk=%.6g\n", nAC, rec->qual, lk_sum, ref_lk);
+    }
 
     // AC, AN
     if ( call->nals_new>1 ) bcf_update_info_int32(call->hdr, rec, "AC", call->ac+1, call->nals_new-1);
     nAC += call->ac[0];
     bcf_update_info_int32(call->hdr, rec, "AN", &nAC, 1);
+    if ( mcall_dbg_level()>=1 )
+    {
+        MCALL_DBG_PFX(call,rec);
+        fprintf(stderr, " step=ac_an");
+        mcall_dbg_vals_i32("ac", call->ac, nals_ori);
+        fprintf(stderr, " an=%d\n", nAC);
+    }
 
     // Remove unused alleles
     hts_expand(char*,call->nals_new,call->nals,call->als);
@@ -1677,6 +1886,14 @@ int mcall(call_t *call, bcf1_t *rec)
     }
 
     bcf_update_info_int32(call->hdr, rec, "I16", NULL, 0);     // remove I16 tag
+
+    if ( mcall_dbg_level()>=1 )
+    {
+        MCALL_DBG_PFX(call,rec);
+        fprintf(stderr, " step=final nals=%d alleles=", rec->n_allele);
+        for (i=0; i<rec->n_allele; i++) fprintf(stderr, "%s%s", i ? "," : "", rec->d.allele[i]);
+        fprintf(stderr, " qual=%.6g ret=%d\n", rec->qual, is_variant ? call->nals_new : 1);
+    }
 
     return is_variant ? call->nals_new : 1;
 }
